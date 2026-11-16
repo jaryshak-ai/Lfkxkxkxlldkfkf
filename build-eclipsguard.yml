@@ -1,0 +1,556 @@
+name: Build EclipsGuard
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p EclipsGuard/src/main/java/eclips/guard EclipsGuard/src/main/resources
+          cat > EclipsGuard/pom.xml <<'EOF_POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>eclips</groupId>
+              <artifactId>EclipsGuard</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+              <build>
+                  <finalName>EclipsGuard</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF_POM
+          cat > EclipsGuard/src/main/resources/plugin.yml <<'EOF_PLUGIN'
+          name: EclipsGuard
+          main: eclips.guard.EclipsGuard
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: Eclips
+          description: "Защита от админов: запрет бедрока/барьера/рамок портала/командных блоков и метка на креатив-предметы"
+          commands:
+            gmhack:
+              description: Снять ограничения EclipsGuard (с себя или с игрока)
+              usage: /gmhack [ник] <on/off>
+              permission: eclipsguard.gmhack
+          permissions:
+            eclipsguard.gmhack:
+              description: Снимать ограничения EclipsGuard
+              default: op
+          EOF_PLUGIN
+          cat > EclipsGuard/src/main/java/eclips/guard/EclipsGuard.java <<'EOF_JAVA'
+          package eclips.guard;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.Server;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.item.EntityItem;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.entity.EntityExplodeEvent;
+          import cn.nukkit.event.inventory.InventoryTransactionEvent;
+          import cn.nukkit.event.player.PlayerCommandPreprocessEvent;
+          import cn.nukkit.event.player.PlayerDropItemEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.inventory.Inventory;
+          import cn.nukkit.inventory.PlayerInventory;
+          import cn.nukkit.inventory.transaction.InventoryTransaction;
+          import cn.nukkit.inventory.transaction.action.InventoryAction;
+          import cn.nukkit.inventory.transaction.action.SlotChangeAction;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.plugin.PluginBase;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          /**
+           * EclipsGuard
+           *  1) нельзя ставить бедрок, рамку портала в энд, барьер, командные блоки;
+           *  2) предметы, полученные в креативе, получают NBT-метку: из блока ничего не выпадает,
+           *     предмет нельзя выбросить / положить в контейнер / продать (/sell, скупщик);
+           *  3) /gmhack [ник] <on/off> - снять ограничения с игрока.
+           */
+          public class EclipsGuard extends PluginBase implements Listener {
+
+              /** NBT-метка креатив-предмета. */
+              public static final String TAG = "EclipsCreative";
+
+              /** Блоки, которые нельзя ставить: id (классические) ... */
+              private static final Set<Integer> BANNED_IDS = new HashSet<>(Arrays.asList(
+                      7,      // bedrock
+                      95,     // invisible bedrock
+                      120,    // end portal frame
+                      137,    // command block
+                      188,    // repeating command block
+                      189,    // chain command block
+                      -161    // barrier
+              ));
+              /** ... и ключевые слова в имени класса блока (на случай других id в этой сборке ядра). */
+              private static final String[] BANNED_CLASS_KEYS = {"bedrock", "endportalframe", "barrier", "commandblock"};
+              /** Названия для /setblock и /fill. */
+              private static final Set<String> BANNED_NAMES = new HashSet<>(Arrays.asList(
+                      "bedrock", "invisible_bedrock", "end_portal_frame", "barrier",
+                      "command_block", "repeating_command_block", "chain_command_block"));
+              /** Команды, которые нельзя использовать с креатив-предметом в руке. */
+              private static final Set<String> HAND_COMMANDS = new HashSet<>(Arrays.asList("sell"));
+              /** Блоки, в которые можно "вложить" предмет правым кликом (рамки, горшки и т.п.). */
+              private static final String[] HOLDER_BLOCK_KEYS = {"itemframe", "flowerpot", "lectern", "jukebox", "campfire", "composter"};
+
+              /** Блоки, которые нельзя открывать в креативе (стол зачарования, воронка, раздатчик, зельеварка, печки, верстак). */
+              private static final String[] CREATIVE_GUI_KEYS = {"enchantingtable", "enchanttable", "hopper", "dispenser", "dropper",
+                      "brewingstand", "furnace", "smoker", "craftingtable"};
+
+              private static final String MSG_GUI = "§c[Eclips] В креативе это открывать нельзя!";
+              private static final String MSG_BANNED = "§c[Eclips] Этот блок ставить нельзя!";
+              private static final String MSG_DROP = "§c[Eclips] Тебе нельзя выбрасывать этот предмет!";
+              private static final String MSG_STORE = "§c[Eclips] Этот предмет нельзя никуда перекладывать, продавать или выставлять!";
+
+              private final Set<UUID> bypass = ConcurrentHashMap.newKeySet();
+              private final Map<UUID, Map<String, Integer>> legit = new HashMap<>();
+              private final Map<UUID, Integer> msgCooldown = new HashMap<>();
+              /** "мир:x:y:z" -> id блока, поставленного креатив-предметом. */
+              private final Map<String, Integer> placed = new ConcurrentHashMap<>();
+              private boolean dirty = false;
+              private int bypassDropUntil = -1;
+              private Path placedFile;
+
+              // ------------------------------------------------------------------ lifecycle
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  placedFile = getDataFolder().toPath().resolve("placed.txt");
+                  loadPlaced();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::scanPlayers, 2);
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::scanDrops, 3);
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::savePlaced, 20 * 60 * 5);
+                  getLogger().info("EclipsGuard включён. Креатив-блоков в базе: " + placed.size());
+              }
+
+              @Override
+              public void onDisable() {
+                  dirty = true;
+                  savePlaced();
+              }
+
+              // ------------------------------------------------------------------ helpers
+
+              private boolean isBypass(Player p) {
+                  return p != null && bypass.contains(p.getUniqueId());
+              }
+
+              public static boolean isMarked(Item it) {
+                  if (it == null || it.getId() == 0 || !it.hasCompoundTag()) return false;
+                  CompoundTag t = it.getNamedTag();
+                  return t != null && t.contains(TAG);
+              }
+
+              private static Item mark(Item it) {
+                  Item c = it.clone();
+                  CompoundTag t = c.hasCompoundTag() && c.getNamedTag() != null ? c.getNamedTag() : new CompoundTag();
+                  t.putByte(TAG, 1);
+                  c.setNamedTag(t);
+                  return c;
+              }
+
+              private static boolean isBanned(Block b) {
+                  if (b == null) return false;
+                  if (BANNED_IDS.contains(b.getId())) return true;
+                  String n = b.getClass().getSimpleName().toLowerCase();
+                  for (String k : BANNED_CLASS_KEYS) if (n.contains(k)) return true;
+                  return false;
+              }
+
+              private static String key(Block b) {
+                  return b.getLevel().getFolderName() + ":" + b.getFloorX() + ":" + b.getFloorY() + ":" + b.getFloorZ();
+              }
+
+              private void deny(Player p, String msg) {
+                  int now = Server.getInstance().getTick();
+                  Integer last = msgCooldown.get(p.getUniqueId());
+                  if (last != null && now - last < 20) return;
+                  msgCooldown.put(p.getUniqueId(), now);
+                  p.sendMessage(msg);
+              }
+
+              private static String itemKey(Item it) {
+                  byte[] nbt = it.hasCompoundTag() ? it.getCompoundTag() : null;
+                  return it.getId() + ":" + it.getDamage() + ":" + it.getCount() + ":" + (nbt == null ? 0 : Arrays.hashCode(nbt));
+              }
+
+              // ------------------------------------------------------------------ 1) запрещённые блоки + креатив-блоки
+
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onPlace(BlockPlaceEvent e) {
+                  Player p = e.getPlayer();
+                  Block b = e.getBlock();
+                  if (!isBypass(p) && isBanned(b)) {
+                      e.setCancelled(true);
+                      deny(p, MSG_BANNED);
+                      return;
+                  }
+                  String k = key(b);
+                  if (isMarked(p.getInventory().getItemInHand())) {
+                      placed.put(k, b.getId());
+                      dirty = true;
+                  } else if (placed.remove(k) != null) {
+                      dirty = true;
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onBreak(BlockBreakEvent e) {
+                  Block b = e.getBlock();
+                  Integer id = placed.remove(key(b));
+                  if (id == null) return;
+                  dirty = true;
+                  if (id != b.getId() || isBypass(e.getPlayer())) return;
+                  e.setDrops(new Item[0]);
+              }
+
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onExplode(EntityExplodeEvent e) {
+                  List<Block> list = new ArrayList<>(e.getBlockList());
+                  boolean changed = false;
+                  Iterator<Block> it = list.iterator();
+                  while (it.hasNext()) {
+                      Block b = it.next();
+                      Integer id = placed.remove(key(b));
+                      if (id == null) continue;
+                      dirty = true;
+                      changed = true;
+                      it.remove();
+                      if (id == b.getId()) b.getLevel().setBlock(b, Block.get(0, 0));
+                  }
+                  if (changed) e.setBlockList(list);
+              }
+
+              // ------------------------------------------------------------------ 2) метка на креатив-предметы
+
+              /** Раз в 2 тика: предметы, которые появились у игрока в креативе, получают метку. */
+              private void scanPlayers() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      try {
+                          scanPlayer(p);
+                      } catch (Throwable t) {
+                          getLogger().warning("scan " + p.getName() + ": " + t);
+                      }
+                  }
+              }
+
+              private void scanPlayer(Player p) {
+                  UUID id = p.getUniqueId();
+                  if (!p.isCreative() || isBypass(p)) {
+                      legit.remove(id);
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  Map<String, Integer> known = legit.get(id);
+                  boolean first = known == null;
+                  Map<String, Integer> work = first ? null : new HashMap<>(known);
+                  Map<String, Integer> next = new HashMap<>();
+                  boolean changed = false;
+                  int size = inv.getSize();
+                  for (int i = 0; i < size; i++) {
+                      Item it = inv.getItem(i);
+                      if (it == null || it.getId() == 0 || isMarked(it)) continue;
+                      String k = itemKey(it);
+                      if (first) {
+                          next.merge(k, 1, Integer::sum);
+                          continue;
+                      }
+                      Integer left = work.get(k);
+                      if (left != null && left > 0) {
+                          work.put(k, left - 1);
+                          next.merge(k, 1, Integer::sum);
+                      } else {
+                          inv.setItem(i, mark(it));
+                          changed = true;
+                      }
+                  }
+                  legit.put(id, next);
+                  if (changed) inv.sendContents(p);
+              }
+
+              /** Раз в 3 тика: удаляем упавшие на землю креатив-предметы. */
+              private void scanDrops() {
+                  if (Server.getInstance().getTick() <= bypassDropUntil) return;
+                  for (Level level : getServer().getLevels().values()) {
+                      for (Entity en : level.getEntities()) {
+                          if (en instanceof EntityItem && isMarked(((EntityItem) en).getItem())) {
+                              en.close();
+                          }
+                      }
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onDrop(PlayerDropItemEvent e) {
+                  Player p = e.getPlayer();
+                  if (!isMarked(e.getItem())) return;
+                  if (isBypass(p)) {
+                      bypassDropUntil = Server.getInstance().getTick() + 5;
+                      return;
+                  }
+                  // событие не отменяем: предмет вылетает и тут же удаляется в scanDrops
+                  deny(p, MSG_DROP);
+              }
+
+              /** Креатив-предмет можно держать только в своём инвентаре. Любой сундук / печка / меню скупщика / крафт - запрещены. */
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onTransaction(InventoryTransactionEvent e) {
+                  InventoryTransaction tr = e.getTransaction();
+                  Player p = tr.getSource();
+                  if (p == null || isBypass(p)) return;
+                  for (InventoryAction a : tr.getActions()) {
+                      if (!(a instanceof SlotChangeAction)) continue;
+                      SlotChangeAction s = (SlotChangeAction) a;
+                      if (!isMarked(s.getTargetItem())) continue;
+                      if (!allowedInventory(s.getInventory(), s.getSlot())) {
+                          e.setCancelled(true);
+                          deny(p, MSG_STORE);
+                          return;
+                      }
+                  }
+              }
+
+              private static boolean allowedInventory(Inventory inv, int slot) {
+                  if (inv == null || inv instanceof PlayerInventory) return true;
+                  String n = inv.getClass().getSimpleName();
+                  switch (n) {
+                      case "PlayerCursorInventory":
+                      case "PlayerOffhandInventory":
+                      case "ArmorInventory":
+                          return true;
+                      case "PlayerUIInventory":
+                          return slot == 0; // курсор; ячейки крафта - нельзя
+                      default:
+                          return false;
+                  }
+              }
+
+              /** Рамки, горшки, проигрыватели и т.п. не принимают креатив-предметы. */
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onInteract(PlayerInteractEvent e) {
+                  Player p = e.getPlayer();
+                  if (isBypass(p)) return;
+                  if (e.getAction() != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+                  Block b = e.getBlock();
+                  if (b == null) return;
+                  String n = b.getClass().getSimpleName().toLowerCase();
+                  // в креативе нельзя открывать станки (с шифтом можно ставить блоки рядом)
+                  if (p.isCreative() && !p.isSneaking()) {
+                      for (String k : CREATIVE_GUI_KEYS) {
+                          if (n.contains(k)) {
+                              e.setCancelled(true);
+                              deny(p, MSG_GUI);
+                              return;
+                          }
+                      }
+                  }
+                  if (!isMarked(e.getItem())) return;
+                  for (String k : HOLDER_BLOCK_KEYS) {
+                      if (n.contains(k)) {
+                          e.setCancelled(true);
+                          deny(p, MSG_STORE);
+                          return;
+                      }
+                  }
+              }
+
+              /** /sell с креатив-предметом в руке; /setblock и /fill с запрещёнными блоками. */
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onCommand(PlayerCommandPreprocessEvent e) {
+                  Player p = e.getPlayer();
+                  String m = e.getMessage();
+                  if (m == null || !m.startsWith("/") || isBypass(p)) return;
+                  String[] parts = m.substring(1).trim().split("\\s+");
+                  if (parts.length == 0 || parts[0].isEmpty()) return;
+                  String label = parts[0].toLowerCase();
+                  if (label.startsWith("minecraft:")) label = label.substring(10);
+                  Command c = getServer().getCommandMap().getCommand(label);
+                  String name = c != null ? c.getName().toLowerCase() : label;
+
+                  if (HAND_COMMANDS.contains(name) && isMarked(p.getInventory().getItemInHand())) {
+                      e.setCancelled(true);
+                      deny(p, MSG_STORE);
+                      return;
+                  }
+                  if (name.equals("setblock") || name.equals("fill")) {
+                      for (int i = 1; i < parts.length; i++) {
+                          String t = parts[i].toLowerCase();
+                          if (t.startsWith("minecraft:")) t = t.substring(10);
+                          if (BANNED_NAMES.contains(t)) {
+                              e.setCancelled(true);
+                              deny(p, MSG_BANNED);
+                              return;
+                          }
+                      }
+                  }
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  UUID id = e.getPlayer().getUniqueId();
+                  bypass.remove(id);
+                  legit.remove(id);
+                  msgCooldown.remove(id);
+              }
+
+              // ------------------------------------------------------------------ 3) /gmhack
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("gmhack")) return false;
+                  if (!sender.hasPermission("eclipsguard.gmhack")) {
+                      sender.sendMessage("§cНет прав.");
+                      return true;
+                  }
+                  Player target;
+                  String mode;
+                  if (args.length == 0) {
+                      mode = "toggle";
+                      target = sender instanceof Player ? (Player) sender : null;
+                  } else if (isMode(args[0])) {
+                      mode = args[0].toLowerCase();
+                      target = sender instanceof Player ? (Player) sender : null;
+                  } else {
+                      target = getServer().getPlayer(args[0]);
+                      mode = args.length > 1 ? args[1].toLowerCase() : "toggle";
+                      if (target == null) {
+                          sender.sendMessage("§cИгрок '" + args[0] + "' не найден.");
+                          return true;
+                      }
+                  }
+                  if (target == null) {
+                      sender.sendMessage("§eИспользование: /gmhack <ник> <on/off>");
+                      return true;
+                  }
+                  if (!isMode(mode) && !mode.equals("toggle")) {
+                      sender.sendMessage("§eИспользование: /gmhack [ник] <on/off>");
+                      return true;
+                  }
+                  UUID id = target.getUniqueId();
+                  boolean on = mode.equals("toggle") ? !bypass.contains(id) : isOn(mode);
+                  if (on) bypass.add(id); else bypass.remove(id);
+                  legit.remove(id);
+                  String state = on ? "§aСНЯТЫ" : "§cВКЛЮЧЕНЫ";
+                  target.sendMessage("§e[Eclips] Ограничения " + state + "§e.");
+                  if (sender != target) {
+                      sender.sendMessage("§e[Eclips] У игрока " + target.getName() + " ограничения " + state + "§e.");
+                  }
+                  getLogger().info(sender.getName() + ": gmhack " + target.getName() + " -> " + (on ? "on" : "off"));
+                  return true;
+              }
+
+              private static boolean isMode(String s) {
+                  s = s.toLowerCase();
+                  return s.equals("on") || s.equals("off") || s.equals("вкл") || s.equals("выкл");
+              }
+
+              private static boolean isOn(String s) {
+                  return s.equals("on") || s.equals("вкл");
+              }
+
+              // ------------------------------------------------------------------ хранилище креатив-блоков
+
+              private void loadPlaced() {
+                  if (!Files.exists(placedFile)) return;
+                  try {
+                      for (String line : Files.readAllLines(placedFile, StandardCharsets.UTF_8)) {
+                          int i = line.lastIndexOf('=');
+                          if (i <= 0) continue;
+                          try {
+                              placed.put(line.substring(0, i), Integer.parseInt(line.substring(i + 1).trim()));
+                          } catch (NumberFormatException ignored) {
+                          }
+                      }
+                  } catch (IOException ex) {
+                      getLogger().warning("placed.txt: " + ex);
+                  }
+              }
+
+              private void savePlaced() {
+                  if (!dirty) return;
+                  dirty = false;
+                  List<String> lines = new ArrayList<>(placed.size());
+                  for (Map.Entry<String, Integer> en : placed.entrySet()) lines.add(en.getKey() + "=" + en.getValue());
+                  try {
+                      Files.write(placedFile, lines, StandardCharsets.UTF_8);
+                  } catch (IOException ex) {
+                      getLogger().warning("placed.txt: " + ex);
+                      dirty = true;
+                  }
+              }
+          }
+          EOF_JAVA
+
+      - name: Build
+        run: mvn -B -f EclipsGuard/pom.xml package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EclipsGuard
+          path: EclipsGuard/target/EclipsGuard.jar
